@@ -1,0 +1,219 @@
+import psutil
+import platform
+import time
+import dash
+from dash import dcc, html
+import plotly.graph_objs as go
+from collections import deque
+import threading
+
+# Initialize data structures with deques to store time series data
+max_points = 50
+times = deque(maxlen=max_points)
+cpu_percentages = deque(maxlen=max_points)
+memory_percentages = deque(maxlen=max_points)
+disk_percentages = deque(maxlen=max_points)
+network_sent = deque(maxlen=max_points)
+network_recv = deque(maxlen=max_points)
+
+# Initialize with some data to prevent empty graph errors
+current_time = time.strftime('%H:%M:%S')
+for _ in range(2):  # Add at least 2 points to start
+    times.append(current_time)
+    cpu_percentages.append(0)
+    memory_percentages.append(0)
+    disk_percentages.append(0)
+    network_sent.append(0)
+    network_recv.append(0)
+
+# Get baseline network counters
+net_io_counters = psutil.net_io_counters()
+last_sent, last_recv = net_io_counters.bytes_sent, net_io_counters.bytes_recv
+last_time = time.time()
+
+# Lock for thread safety when updating data
+data_lock = threading.Lock()
+
+
+# Function to collect system data
+def collect_data():
+    global last_sent, last_recv, last_time
+
+    while True:
+        # Collect current time
+        current_time = time.strftime('%H:%M:%S')
+
+        # Collect CPU usage
+        cpu_percent = psutil.cpu_percent(interval=1)  # This has a built-in delay of 1 second
+
+        # Collect memory usage
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+
+        # Collect disk usage
+        disk = psutil.disk_usage('/')
+        disk_percent = disk.percent
+
+        # Collect network usage (calculate rate)
+        net_io_counters = psutil.net_io_counters()
+        current_time_sec = time.time()
+        time_diff = current_time_sec - last_time
+
+        # Calculate bytes per second
+        bytes_sent = (net_io_counters.bytes_sent - last_sent) / time_diff / 1024  # KB/s
+        bytes_recv = (net_io_counters.bytes_recv - last_recv) / time_diff / 1024  # KB/s
+
+        # Update last values
+        last_sent = net_io_counters.bytes_sent
+        last_recv = net_io_counters.bytes_recv
+        last_time = current_time_sec
+
+        # Safely update data structures
+        with data_lock:
+            times.append(current_time)
+            cpu_percentages.append(cpu_percent)
+            memory_percentages.append(memory_percent)
+            disk_percentages.append(disk_percent)
+            network_sent.append(bytes_sent)
+            network_recv.append(bytes_recv)
+
+        # This function already has a built-in delay from the cpu_percent call
+        # Additional sleep not needed
+
+
+# Initialize Dash app
+app = dash.Dash(__name__)
+
+# Create the layout with system information and charts
+app.layout = html.Div([
+    html.H1("System Health Dashboard"),
+
+    html.Div([
+        html.H3("System Information"),
+        html.Table([
+            html.Tr([html.Td("System:"), html.Td(f"{platform.system()} {platform.version()}")]),
+            html.Tr([html.Td("Processor:"), html.Td(platform.processor())]),
+            html.Tr([html.Td("Python Version:"), html.Td(platform.python_version())])
+        ], style={'border': '1px solid #ddd', 'padding': '8px', 'width': '100%'})
+    ], style={'marginBottom': 20}),
+
+    html.Div([
+        html.Div([
+            html.H3("CPU Usage"),
+            dcc.Graph(id='cpu-graph'),
+        ], style={'width': '49%', 'display': 'inline-block'}),
+
+        html.Div([
+            html.H3("Memory Usage"),
+            dcc.Graph(id='memory-graph'),
+        ], style={'width': '49%', 'display': 'inline-block', 'float': 'right'}),
+    ]),
+
+    html.Div([
+        html.Div([
+            html.H3("Disk Usage"),
+            dcc.Graph(id='disk-graph'),
+        ], style={'width': '49%', 'display': 'inline-block'}),
+
+        html.Div([
+            html.H3("Network Traffic (KB/s)"),
+            dcc.Graph(id='network-graph'),
+        ], style={'width': '49%', 'display': 'inline-block', 'float': 'right'}),
+    ]),
+
+    dcc.Interval(
+        id='interval-component',
+        interval=2 * 1000,  # Update every 2 seconds
+        n_intervals=0
+    )
+])
+
+
+@app.callback(
+    [dash.dependencies.Output('cpu-graph', 'figure'),
+     dash.dependencies.Output('memory-graph', 'figure'),
+     dash.dependencies.Output('disk-graph', 'figure'),
+     dash.dependencies.Output('network-graph', 'figure')],
+    [dash.dependencies.Input('interval-component', 'n_intervals')]
+)
+def update_graphs(_):
+    with data_lock:
+        times_list = list(times)
+        cpu_list = list(cpu_percentages)
+        memory_list = list(memory_percentages)
+        disk_list = list(disk_percentages)
+        net_sent_list = list(network_sent)
+        net_recv_list = list(network_recv)
+
+    # Ensure we have data to display
+    if not times_list:
+        return {}, {}, {}, {}
+
+    # CPU Graph
+    cpu_figure = go.Figure(
+        data=[go.Scatter(x=times_list, y=cpu_list, name='CPU %', line=dict(color='#4285F4'))]
+    )
+    cpu_figure.update_layout(
+        xaxis=dict(range=[min(times_list), max(times_list)]),
+        yaxis=dict(range=[0, 100], title='Percentage'),
+        margin=dict(l=20, r=20, t=20, b=20)
+    )
+
+    # Memory Graph
+    memory_figure = go.Figure(
+        data=[go.Scatter(x=times_list, y=memory_list, name='Memory %', line=dict(color='#DB4437'))]
+    )
+    memory_figure.update_layout(
+        xaxis=dict(range=[min(times_list), max(times_list)]),
+        yaxis=dict(range=[0, 100], title='Percentage'),
+        margin=dict(l=20, r=20, t=20, b=20)
+    )
+
+    # Disk Graph
+    disk_figure = go.Figure(
+        data=[go.Scatter(x=times_list, y=disk_list, name='Disk %', line=dict(color='#F4B400'))]
+    )
+    disk_figure.update_layout(
+        xaxis=dict(range=[min(times_list), max(times_list)]),
+        yaxis=dict(range=[0, 100], title='Percentage'),
+        margin=dict(l=20, r=20, t=20, b=20)
+    )
+
+    # Network Graph
+    network_figure = go.Figure()
+    network_figure.add_trace(go.Scatter(
+        x=times_list,
+        y=net_sent_list,
+        name='Upload',
+        line=dict(color='#0F9D58')
+    ))
+    network_figure.add_trace(go.Scatter(
+        x=times_list,
+        y=net_recv_list,
+        name='Download',
+        line=dict(color='#4285F4')
+    ))
+
+    # Calculate y-axis range dynamically based on data
+    max_net = max(max(net_sent_list or [0]), max(net_recv_list or [0]))
+    y_max = max(100, max_net * 1.1)  # Ensure minimum range of 100 KB/s
+
+    network_figure.update_layout(
+        xaxis=dict(range=[min(times_list), max(times_list)]),
+        yaxis=dict(range=[0, y_max], title='KB/s'),
+        margin=dict(l=20, r=20, t=20, b=20)
+    )
+
+    return cpu_figure, memory_figure, disk_figure, network_figure
+
+
+if __name__ == '__main__':
+    # Start data collection in a separate thread
+    data_thread = threading.Thread(target=collect_data, daemon=True)
+    data_thread.start()
+
+    # Give the data collection thread a moment to collect initial data
+    time.sleep(2)
+
+    # Start the Dash web server - FIXED METHOD NAME
+    app.run(host='0.0.0.0', port=8050, debug=False)
